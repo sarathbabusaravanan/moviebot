@@ -2,11 +2,13 @@ import argparse
 import json
 import os
 import re
+import shutil
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from patchright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # --- CONFIGURATION ---
 BMS_URL = (
@@ -299,7 +301,6 @@ EXTRACT_SHOWTIME_CARDS_JS = r"""
 
 IST = timezone(timedelta(hours=5, minutes=30))
 IS_CI = os.getenv("CI", "").lower() == "true"
-HEADLESS = IS_CI or os.getenv("HEADLESS", "false").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCREENSHOT_DIR = "screenshots"
@@ -377,6 +378,30 @@ def send_telegram_alert(message: str) -> bool:
             all_ok = False
 
     return all_ok
+
+
+def is_blocked_content(title: str, body_text: str) -> bool:
+    lower_title = (title or "").lower()
+    lower_body = (body_text or "").lower()
+    return any(flag in lower_body or flag in lower_title for flag in BLOCK_INDICATORS)
+
+
+def wait_past_cloudflare(page, max_wait_sec: int = 14) -> tuple[str, str]:
+    """Wait briefly in case a Cloudflare JS challenge resolves on its own."""
+    for _ in range(max_wait_sec // 2):
+        title = page.title()
+        try:
+            raw_text = page.inner_text("body")
+        except Exception:
+            raw_text = ""
+        if not is_blocked_content(title, raw_text):
+            return title, raw_text
+        page.wait_for_timeout(2000)
+
+    try:
+        return page.title(), page.inner_text("body")
+    except Exception:
+        return page.title(), ""
 
 
 def match_target_theatres(cards: list[dict]) -> dict[str, dict]:
@@ -461,17 +486,12 @@ def check_site_all_dates(page, site_name: str, url: str, ss_prefix: str) -> dict
         response = page.goto(url, wait_until="domcontentloaded", timeout=45000)
         http_status = response.status if response else "unknown"
         log(f"  -> HTTP status: {http_status}")
-        page.wait_for_timeout(5000)
+        page.wait_for_timeout(4000)
 
-        if site_name == "Zomato District":
-            handle_district_language_popup(page)
-            result["url"] = page.url
-
-        title = page.title()
+        title, raw_text = wait_past_cloudflare(page)
         log(f"  -> Page title: {title}")
 
-        raw_text = page.inner_text("body")
-        if any(flag in raw_text.lower() or flag in title.lower() for flag in BLOCK_INDICATORS):
+        if is_blocked_content(title, raw_text):
             result["status"] = "BLOCKED"
             result["note"] = "Anti-bot / Cloudflare challenge detected"
             log(f"  -> [BLOCKED] {result['note']}")
@@ -479,6 +499,10 @@ def check_site_all_dates(page, site_name: str, url: str, ss_prefix: str) -> dict
             if ss:
                 result["screenshots"].append(ss)
             return result
+
+        if site_name == "Zomato District":
+            handle_district_language_popup(page)
+            result["url"] = page.url
 
         page.evaluate("window.scrollTo(0, 0)")
         page.wait_for_timeout(300)
@@ -686,30 +710,27 @@ def build_telegram_message(bms: dict, dist: dict, alerted: set[str]) -> tuple[st
 
 def run_once() -> None:
     log(f"\nStarting multi-date ticket check at {now_ist()}...")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=HEADLESS,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1366, "height": 768},
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-        )
-        page = context.new_page()
-        page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
+    profile_dir = tempfile.mkdtemp(prefix="patchright_profile_")
 
-        bms_res = check_site_all_dates(page, "BookMyShow", BMS_URL, "bms")
-        dist_res = check_site_all_dates(page, "Zomato District", DISTRICT_URL, "district")
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
+                channel="chrome",
+                headless=False,
+                no_viewport=True,
+                args=["--window-size=1366,768"],
+                locale="en-IN",
+                timezone_id="Asia/Kolkata",
+            )
+            page = context.pages[0] if context.pages else context.new_page()
 
-        browser.close()
+            bms_res = check_site_all_dates(page, "BookMyShow", BMS_URL, "bms")
+            dist_res = check_site_all_dates(page, "Zomato District", DISTRICT_URL, "district")
+
+            context.close()
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
 
     print_terminal_report(bms_res, dist_res)
 
