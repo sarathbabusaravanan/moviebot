@@ -36,8 +36,10 @@ jobs:
       - name: Install Python packages
         run: pip install -r requirements.txt
 
-      - name: Install Playwright Chromium
-        run: python -m playwright install --with-deps chromium
+      - name: Install Patchright Chrome and Xvfb
+        run: |
+          python -m patchright install chrome
+          command -v xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
 
       - name: Run ticket checker
         env:
@@ -45,7 +47,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FORCE_ALERT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_alert || 'false' }}
-        run: python check_tickets.py
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" python check_tickets.py
 
       - name: Save alert state
         run: |
